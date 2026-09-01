@@ -5,6 +5,10 @@ run-name: >-
 on:
   workflow_dispatch:
     inputs:
+      ipa_url:
+        description: "Direct link to the Discord IPA file"
+        required: true
+        type: string
       version:
         default: ""
         description: "Discord app version"
