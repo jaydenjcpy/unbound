@@ -1,10 +1,6 @@
 name: Build Unbound
 run-name: >-
-  ${{
-    inputs.only_app_repo == true && 'app-repo deploy' ||
-    inputs.only_apt_repo == true && 'apt-repo deploy' ||
-    format('{0} for {1}', (inputs.release == true && 'Release' || 'Build'), (inputs.version != '' && inputs.version || inputs.ipa_url != '' && inputs.ipa_url || 'latest stable'))
-  }}
+  ${{ inputs.version != '' && inputs.version || inputs.ipa_url != '' && inputs.ipa_url || 'latest stable' }}
 
 on:
   workflow_dispatch:
@@ -22,36 +18,20 @@ on:
         default: true
         description: "Include extensions (OpenInDiscord & ShareToDiscord)"
         type: boolean
-      only_app_repo:
-        default: false
-        description: "Build and deploy app-repo"
-        type: boolean
-      only_apt_repo:
-        default: false
-        description: "Build and deploy apt-repo"
-        type: boolean
   workflow_call:
     inputs:
       ipa_url:
         default: ""
         type: string
+      version:
+        default: ""
+        type: string
       release:
         default: true
         type: boolean
-      is_testflight:
-        default: false
-        type: boolean
-      authenticated_source:
-        default: false
-        type: boolean
-      dkrypt_base_url:
-        default: "https://ipa.dylib.dev"
-        type: string
       add_extensions:
         default: true
         type: boolean
-      caller_workflow:
-        type: string
     outputs:
       deb_url:
         description: "Download URL for the deb package artifact"
@@ -83,7 +63,6 @@ env:
 
 jobs:
   build-tweak:
-    if: &only_build_check inputs.only_app_repo != true && inputs.only_apt_repo != true
     runs-on: macos-26
     timeout-minutes: 30
     permissions:
@@ -153,59 +132,7 @@ jobs:
           DEB_FILENAME=$(basename "$DEB_FILE")
           echo "filename=$DEB_FILENAME" >> $GITHUB_OUTPUT
 
-  resolve-source-ipa:
-    name: resolve source ipa
-    if: *only_build_check
-    runs-on: ubuntu-latest
-    timeout-minutes: 50
-    outputs:
-      channel: ${{ steps.resolve.outputs.channel }}
-      is_testflight: ${{ steps.resolve.outputs.is_testflight }}
-      version: ${{ steps.resolve.outputs.version }}
-      cache_hit: ${{ steps.resolve.outputs.cache_hit }}
-    steps:
-      - name: checkout resolver
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - name: setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
-        with:
-          cache: false
-          go-version-file: go.mod
-
-      - name: resolve and download source ipa
-        id: resolve
-        env:
-          DKRYPT_API_KEY: ${{ secrets.DKRYPT_API_KEY }}
-          INPUT_VERSION: ${{ inputs.version }}
-          INPUT_IPA_URL: ${{ inputs.ipa_url }}
-          INPUT_IS_TESTFLIGHT: ${{ inputs.is_testflight }}
-          INPUT_AUTHENTICATED_SOURCE: ${{ inputs.authenticated_source }}
-          INPUT_DKRYPT_BASE_URL: ${{ inputs.dkrypt_base_url }}
-        run: |
-          if [ -z "$INPUT_IPA_URL" ]; then
-            go run ./tools fetch \
-              --base-url https://ipa.dylib.dev \
-              --bundle-id com.hammerandchisel.discord \
-              --version "$INPUT_VERSION" \
-              --output discord.ipa
-          else
-            channel=appstore
-            if [ "$INPUT_IS_TESTFLIGHT" = true ]; then channel=testflight; fi
-            fetch_args=(--base-url "$INPUT_DKRYPT_BASE_URL" --source-url "$INPUT_IPA_URL")
-            if [ "$INPUT_AUTHENTICATED_SOURCE" = true ]; then fetch_args+=(--authenticated-source); fi
-            fetch_args+=(--channel "$channel" --version "$INPUT_VERSION" --output discord.ipa)
-            go run ./tools fetch "${fetch_args[@]}"
-          fi
-
-      - name: upload source ipa
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
-        with:
-          name: source ipa
-          path: discord.ipa
-
   build-ipa:
-    if: *only_build_check
     runs-on: macos-15
     timeout-minutes: 45
     permissions:
@@ -213,7 +140,7 @@ jobs:
       id-token: write
       attestations: write
       artifact-metadata: write
-    needs: [build-tweak, resolve-source-ipa]
+    needs: [build-tweak]
     outputs:
       ipa_url: ${{ steps.upload-ipa.outputs.artifact-url }}
       ipa_filename: ${{ steps.set-ipa-filename.outputs.filename }}
@@ -243,6 +170,16 @@ jobs:
         with:
           merge-multiple: true
 
+      - name: download source ipa
+        run: |
+          set -euo pipefail
+          IPA_URL="${{ inputs.ipa_url }}"
+          if [ -z "$IPA_URL" ]; then
+            echo "Error: ipa_url input is required"
+            exit 1
+          fi
+          curl -fSL "$IPA_URL" -o discord.ipa
+
       - name: setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
         with:
@@ -256,10 +193,9 @@ jobs:
 
       - name: build IPA
         env:
-          BUILD_CHANNEL: ${{ needs.resolve-source-ipa.outputs.channel }}
           BUILD_EXTENSIONS: ${{ inputs.add_extensions == true && 'include' || 'exclude' }}
         run: |
-          go run ./tools build ipa --ipa discord.ipa --deb "$(find . -maxdepth 1 -name '*.deb' -print -quit)" --channel "$BUILD_CHANNEL" --extensions "$BUILD_EXTENSIONS" --output "${APP_NAME}.ipa" --non-interactive
+          go run ./tools build ipa --ipa discord.ipa --deb "$(find . -maxdepth 1 -name '*.deb' -print -quit)" --channel appstore --extensions "$BUILD_EXTENSIONS" --output "${APP_NAME}.ipa" --non-interactive
 
       - name: upload ipa as artifact
         id: upload-ipa
@@ -278,7 +214,6 @@ jobs:
         run: echo "filename=${{ env.APP_NAME }}.ipa" >> $GITHUB_OUTPUT
 
   build-simulator:
-    if: *only_build_check
     runs-on: macos-15
     timeout-minutes: 20
     permissions:
@@ -333,12 +268,12 @@ jobs:
         run: echo "filename=unbound-ios-simulator.zip" >> $GITHUB_OUTPUT
 
   release-app:
-    if: inputs.caller_workflow != 'ci' && inputs.release == true && inputs.only_app_repo != true && inputs.only_apt_repo != true
+    if: inputs.release == true
     runs-on: macos-15
     timeout-minutes: 15
     permissions:
       contents: write
-    needs: [build-tweak, build-ipa, build-simulator, resolve-source-ipa]
+    needs: [build-tweak, build-ipa, build-simulator]
 
     steps:
       - name: checkout code
@@ -362,12 +297,6 @@ jobs:
           test -f "$IPA_FILE"
           IPA_INFO=$(go run ./tools ipa-info --ipa "$IPA_FILE")
           VERSION=$(printf '%s\n' "$IPA_INFO" | jq -r '.version')
-          
-          if [[ "${{ needs.resolve-source-ipa.outputs.is_testflight }}" == true ]]; then
-            BUILD=$(printf '%s\n' "$IPA_INFO" | jq -r '.build')
-            VERSION="${VERSION}_${BUILD}"
-          fi
-          
           echo "DISCORD_VERSION=$VERSION" >> $GITHUB_ENV
 
       - name: create GitHub Release
@@ -380,211 +309,8 @@ jobs:
             ${{ needs.build-simulator.outputs.simulator_filename }}
             ${{ needs.build-ipa.outputs.ipa_filename }}
           generate_release_notes: true
-          prerelease: ${{ needs.resolve-source-ipa.outputs.is_testflight == 'true' }}
+          prerelease: false
           fail_on_unmatched_files: true
           token: ${{ env.GITHUB_TOKEN }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-
-  deploy-pages:
-    if: |
-      always() &&
-      (
-        inputs.only_app_repo == true ||
-        inputs.only_apt_repo == true ||
-        (inputs.caller_workflow != 'ci' && inputs.release == true && needs.release-app.result == 'success')
-      )
-    continue-on-error: true
-    runs-on: ubuntu-latest
-    timeout-minutes: 20
-    needs: [build-tweak, release-app, resolve-source-ipa]
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
-    permissions:
-      contents: read
-      pages: write
-      id-token: write
-    env:
-      GPG_KEY: ${{ secrets.GPG_KEY }}
-    steps:
-      - name: checkout code
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
-
-      - name: setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e
-        with:
-          cache: false
-          go-version-file: go.mod
-
-      - name: download deb artifact
-        if: inputs.only_app_repo != true && inputs.only_apt_repo != true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: rootless package
-          path: apt-repo/repo/debs
-
-      - name: download latest release deb
-        if: inputs.only_apt_repo == true
-        run: |
-          mkdir -p apt-repo/repo/debs
-          gh release download --repo ${{ github.repository }} --pattern '*arm64.deb' --dir apt-repo/repo/debs --clobber
-
-      - name: capture new deb filename
-        if: inputs.only_app_repo != true
-        run: echo "NEW_DEB_FILENAME=$(basename $(ls apt-repo/repo/debs/*.deb))" >> $GITHUB_ENV
-
-      - name: download ipa artifact
-        if: inputs.only_app_repo != true && inputs.only_apt_repo != true
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c
-        with:
-          name: ipa
-
-      - name: download latest release ipa
-        if: inputs.only_app_repo == true
-        env:
-          VERSION_SELECTOR: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          if [ -z "$VERSION_SELECTOR" ]; then
-            gh release download --repo "${{ github.repository }}" --pattern '*.ipa' --clobber
-          else
-            selector="${VERSION_SELECTOR#v}"
-            tag="v$selector"
-            if ! gh release download "$tag" --repo "${{ github.repository }}" --pattern '*.ipa' --clobber; then
-              if [[ "$selector" == *_* ]]; then
-                train="${selector%%_*}"
-                build="${selector#*_}"
-                if [[ "$train" != *.* ]]; then
-                  gh release download "v${train}.0_${build}" --repo "${{ github.repository }}" --pattern '*.ipa' --clobber
-                else
-                  exit 1
-                fi
-              elif [[ "$selector" != *.* ]]; then
-                gh release download "${tag}.0" --repo "${{ github.repository }}" --pattern '*.ipa' --clobber
-              else
-                exit 1
-              fi
-            fi
-          fi
-
-      - name: restore live site state
-        run: |
-          PACKAGE_ID=$(grep '^Package:' control | cut -d ' ' -f 2)
-          mkdir -p "apt-repo/repo/depictions/web/$PACKAGE_ID" apt-repo/repo/debs
-          cp app-repo.json apt-repo/repo/app-repo.json
-
-          PAGES_URL=$(gh api "repos/${{ github.repository }}/pages" --jq '.html_url // empty')
-          if [ -z "$PAGES_URL" ]; then
-            echo "GitHub Pages not deployed yet, starting fresh"
-            exit 0
-          fi
-          PAGES_URL="${PAGES_URL%/}"
-
-          curl -fsSL "$PAGES_URL/app-repo.json" -o apt-repo/repo/app-repo.json.live \
-            && mv apt-repo/repo/app-repo.json.live apt-repo/repo/app-repo.json \
-            || echo "No live app-repo.json yet, using repo template"
-
-          curl -fsSL "$PAGES_URL/depictions/web/$PACKAGE_ID/info.xml" -o "apt-repo/repo/depictions/web/$PACKAGE_ID/info.xml" \
-            || echo "No live depiction yet, using repo template"
-
-          if curl -fsSL "$PAGES_URL/Packages" -o previous-Packages; then
-            grep '^Filename:' previous-Packages | awk '{print $2}' | sed 's|^\./||' | while read -r deb_path; do
-              deb_name=$(basename "$deb_path")
-              dest="apt-repo/repo/debs/$deb_name"
-              if [ -f "$dest" ]; then
-                continue
-              fi
-              echo "Restoring $deb_name"
-              curl -fsSL "$PAGES_URL/$deb_path" -o "$dest" || echo "Warning: failed to restore $deb_name"
-            done
-            rm -f previous-Packages
-          else
-            echo "No live Packages file found, starting fresh"
-          fi
-
-      - name: update app-repo.json
-        if: inputs.only_apt_repo != true
-        env:
-          VERSION_SELECTOR: ${{ inputs.version }}
-        run: |
-          set -euo pipefail
-          APP_FILE=$(ls *.ipa)
-          IPA_INFO=$(go run ./tools ipa-info --ipa "$APP_FILE")
-          VERSION=$(printf '%s\n' "$IPA_INFO" | jq -r '.version')
-
-          if [ "${{ inputs.only_app_repo }}" == true ]; then
-            if [[ "$VERSION_SELECTOR" == *_* ]]; then
-              IS_TESTFLIGHT=true
-            else
-              IS_TESTFLIGHT=false
-            fi
-          else
-            IS_TESTFLIGHT="${{ needs.resolve-source-ipa.outputs.is_testflight }}"
-          fi
-
-          if [[ "$IS_TESTFLIGHT" == true ]]; then
-            BUILD=$(printf '%s\n' "$IPA_INFO" | jq -r '.build')
-            VERSION="${VERSION}_${BUILD}"
-            APP_INDEX=1
-          else
-            APP_INDEX=0
-          fi
-
-          NAME=$(grep '^Name:' control | cut -d ' ' -f 2)
-          DATE=$(date -u +"%Y-%m-%d")
-          IPA_SIZE=$(stat -c%s "$APP_FILE")
-          DOWNLOAD_URL=https://github.com/${{ github.repository }}/releases/download/v$VERSION/$NAME.ipa
-          NEW_ENTRY=$(jq -n --arg version "$VERSION" --arg date "$DATE" --arg size "$IPA_SIZE" --arg downloadURL "$DOWNLOAD_URL" '{version: $version, date: $date, size: ($size | tonumber), downloadURL: $downloadURL, localizedDescription: "Further improvements to overall system stability and other minor adjustments have been made to enhance the user experience."}')
-
-          VERSION_EXISTS=$(jq --arg version "$VERSION" --argjson index "$APP_INDEX" '.apps[$index].versions | map(select(.version == $version)) | length' apt-repo/repo/app-repo.json)
-          if [ "$VERSION_EXISTS" -gt 0 ]; then
-            jq --argjson newEntry "$NEW_ENTRY" --argjson index "$APP_INDEX" --arg version "$VERSION" '.apps[$index].versions |= map(if .version == $version then $newEntry else . end)' apt-repo/repo/app-repo.json > temp.json
-          else
-            jq --argjson newEntry "$NEW_ENTRY" --argjson index "$APP_INDEX" '.apps[$index].versions |= [$newEntry] + .' apt-repo/repo/app-repo.json > temp.json
-          fi
-          mv temp.json apt-repo/repo/app-repo.json
-
-      - name: update depiction version
-        if: inputs.only_app_repo != true
-        run: |
-          DEB_FILE="apt-repo/repo/debs/${{ env.NEW_DEB_FILENAME }}"
-          VERSION=$(dpkg-deb -f "$DEB_FILE" Version)
-          PACKAGE_ID=$(dpkg-deb -f "$DEB_FILE" Package)
-
-          INFO_XML="apt-repo/repo/depictions/web/$PACKAGE_ID/info.xml"
-          if [ -f "$INFO_XML" ]; then
-            sed -i "s|<version>.*</version>|<version>$VERSION</version>|" "$INFO_XML"
-          else
-            echo "Warning: no web depiction at $INFO_XML for $PACKAGE_ID"
-          fi
-
-      - name: install apt-ftparchive & compressors
-        run: sudo apt-get update && sudo apt-get install -y apt-utils xz-utils zstd bzip2 lz4 gzip gnupg
-
-      - name: import GPG key
-        if: ${{ env.GPG_KEY != '' }}
-        run: |
-          echo "$GPG_KEY" | gpg --import
-          echo "GPG_KEY_ID=$(gpg --list-secret-keys --keyid-format LONG | grep sec | cut -d'/' -f2 | cut -d' ' -f1)" >> $GITHUB_ENV
-
-      - name: update repository
-        working-directory: apt-repo
-        env:
-          GPG_KEY_ID: ${{ env.GPG_KEY_ID }}
-        run: |
-          chmod +x update-repo.sh
-          ./update-repo.sh
-
-      - name: setup Pages
-        uses: actions/configure-pages@45bfe0192ca1faeb007ade9deae92b16b8254a0d
-
-      - name: upload Pages artifact
-        uses: actions/upload-pages-artifact@fc324d3547104276b827a68afc52ff2a11cc49c9
-        with:
-          path: apt-repo/repo
-          retention-days: 90
-
-      - name: deploy to GitHub Pages
-        id: deployment
-        uses: actions/deploy-pages@cd2ce8fcbc39b97be8ca5fce6e763baed58fa128
